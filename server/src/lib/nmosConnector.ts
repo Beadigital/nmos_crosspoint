@@ -280,6 +280,12 @@ export class NmosRegistryConnector {
 
             this.connections[fullResource].ws.onclose = () => {
                 this.connections[fullResource].ws.onmessage = (message) => {};
+
+                const conn = this.connections[fullResource];
+                if (conn.pingInterval) {
+                    clearInterval(conn.pingInterval);
+                    conn.pingInterval = null;
+                }
                 
                 SyncLog.log("error",  "NMOS","Closed subscription to Registry: " + nmosRegistryUrl + ", " + resource + ", " + version );
                 setTimeout(()=>{
@@ -289,9 +295,24 @@ export class NmosRegistryConnector {
             };
             this.connections[fullResource].ws.onopen = () => {
                 this.updateSyncConnectionState();
+
+                const conn = this.connections[fullResource];
+                conn.lastMessageTs = Date.now();
+
+                if (!conn.pingIntervall) {
+                    conn.pingIntervall = setIntervall() => {
+                        try {
+                            if (conn.ws.readyState === WebSocket.OPEN) {
+                                conn.ws.ping();
+                            }
+                        } catch (e)                    
+                    }, 20000);
+                }
             };
 
             this.connections[fullResource].ws.onmessage = (message) => {
+                const conn = this.connections[fullResource];
+                conn.lastMessageTs = Date.now();
                 this.updateState(JSON.parse(message.data),version);
             };
             
