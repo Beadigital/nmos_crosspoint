@@ -77,25 +77,27 @@ export class NmosRegistryConnector {
 
         // TODO dev cleanup
         //if(loaddev){
-        if(false){
+        if (!false) {
+        } else {
             try {
                 let rawFile = fs.readFileSync("./state/devnmosstate/devnmosstate.json");
                 let nmosDev = JSON.parse(rawFile);
 
-                for(let type in nmosDev){
-                    for(let path in nmosDev[type]){
+                for (let type in nmosDev) {
+                    for (let path in nmosDev[type]) {
                         let postData = nmosDev[type][path];
-                            NmosRegistryConnector.modifierCallbackList[type].forEach((f)=>{
-                                postData = f(path, postData);
-                            })
-                            this.nmosState[type][path] = postData;
-                            NmosRegistryConnector.hookCallbackList[type].forEach((f)=>{
-                                f(path, postData);
-                            })
+                        NmosRegistryConnector.modifierCallbackList[type].forEach((f) => {
+                            postData = f(path, postData);
+                        })
+                        this.nmosState[type][path] = postData;
+                        NmosRegistryConnector.hookCallbackList[type].forEach((f) => {
+                            f(path, postData);
+                        })
                     }
                 }
 
-            } catch (e) {}
+            } catch (e) {
+            }
             this.syncNmos.setState(this.nmosState);
             this.updateCrosspoint();
         }
@@ -147,6 +149,7 @@ export class NmosRegistryConnector {
                 }
             });
         });
+        this.startConnectionsWatchdog();
     }
 
     private mdnsQuery() {
@@ -243,7 +246,57 @@ export class NmosRegistryConnector {
         channelmapping:{},
         sendersManifestDetail :{}
     };
-    private connections = {};
+    private connections: { [key: string]: any } = {};
+    private connectionsWatchdogStarted = false;
+
+    private parseConnectionKey(key: string): { url: string; resource: string; version: string } | null {
+    // fullResource format: "<url>_<resource>_<version>"
+    const match = key.match(/^(.*)_(\/[^_]+)_(v\d+\.\d+)$/);
+    if (!match) {
+        return null;
+    }
+    const [, url, resource, version] = match;
+    return { url, resource, version };
+}
+
+private startConnectionsWatchdog() {
+    if (this.connectionsWatchdogStarted) {
+        return;
+    }
+    this.connectionsWatchdogStarted = true;
+
+    setInterval(() => {
+        const now = Date.now();
+        Object.keys(this.connections).forEach((key) => {
+            const conn = this.connections[key];
+            if (!conn || !conn.ws) {
+                return;
+            }
+            if (conn.ws.readyState !== WebSocket.OPEN) {
+                return;
+            }
+            const last = conn.lastMessageTs || 0;
+            const age = now - last;
+
+            if (age > 12000000000000) {
+                SyncLog.log(
+                    "warn",
+                    "NMOS",
+                    "No messages from registry subscription for " + age + "ms, reconnecting: " + key
+                );
+                try {
+                    conn.ws.close();
+                } catch (e) {
+                    // ignore
+                }
+                const parsed = this.parseConnectionKey(key);
+                if (parsed) {
+                    this.getVersionSubscription(parsed.url, parsed.resource, parsed.version);
+                }
+            }
+        });
+    }, 30000);
+}
 
 
     private getSubscription(nmosRegistryUrl: string, resource: string) {
@@ -252,83 +305,123 @@ export class NmosRegistryConnector {
         })
     }
 
-    private getVersionSubscription(nmosRegistryUrl: string, resource: string, version:string){
-        axios.post(nmosRegistryUrl + "/x-nmos/query/" + version + "/subscriptions", {
+    private getVersionSubscription(nmosRegistryUrl: string, resource: string, version: string) {
+    axios
+        .post(nmosRegistryUrl + "/x-nmos/query/" + version + "/subscriptions", {
             resource_path: resource,
             params: {},
             persist: false,
             max_update_rate_ms: 50,
-        }).then((response: any) => {
+        })
+        .then((response: any) => {
             this.logReset = true;
-            let subscription = response.data;
-            let fullResource = nmosRegistryUrl + "_" + resource + "_" + version;
+            const subscription = response.data;
+            const fullResource = nmosRegistryUrl + "_" + resource + "_" + version;
+
+            // Clean up any existing connection for this resource/version
             if (this.connections[fullResource]) {
-                this.connections[fullResource].ws.onmessage = (message) => {};
-                try{
-                    this.connections[fullResource].ws.close();
-                }catch(e){}
+                const oldConn = this.connections[fullResource];
+                oldConn.ws.onmessage = (message: any) => {};
+                try {
+                    oldConn.ws.close();
+                } catch (e) {}
+                if (oldConn.pingInterval) {
+                    clearInterval(oldConn.pingInterval);
+                    oldConn.pingInterval = null;
+                }
             }
+
+            // Create new WebSocket connection
             this.connections[fullResource] = {
                 version,
                 subscription,
                 ws: new WebSocket(subscription.ws_href),
+                lastMessageTs: Date.now(),
+                pingInterval: null,
             };
 
-            this.connections[fullResource].ws.error = () => {
-                this.connections[fullResource].ws.onmessage = (message) => {};
+            const conn = this.connections[fullResource];
+
+            conn.ws.on("pong", () => {
+                SyncLog.log("info", "NMOS", "Received PONG from registry.")
+            });
+
+            conn.ws.onerror = () => {
+                // We don't do heavy error handling here, but we stop processing messages.
+                conn.ws.onmessage = (message: any) => {};
             };
 
-            this.connections[fullResource].ws.onclose = () => {
-                this.connections[fullResource].ws.onmessage = (message) => {};
+            conn.ws.onclose = () => {
+                conn.ws.onmessage = (message: any) => {};
 
-                const conn = this.connections[fullResource];
                 if (conn.pingInterval) {
                     clearInterval(conn.pingInterval);
                     conn.pingInterval = null;
                 }
-                
-                SyncLog.log("error",  "NMOS","Closed subscription to Registry: " + nmosRegistryUrl + ", " + resource + ", " + version );
-                setTimeout(()=>{
-                    this.getVersionSubscription(nmosRegistryUrl,resource,version );
-                },1000)
+
+                SyncLog.log(
+                    "error",
+                    "NMOS",
+                    "Closed subscription to Registry: " + nmosRegistryUrl + ", " + resource + ", " + version
+                );
+                setTimeout(() => {
+                    this.getVersionSubscription(nmosRegistryUrl, resource, version);
+                }, 1000);
                 this.updateSyncConnectionState();
             };
-            this.connections[fullResource].ws.onopen = () => {
-                this.updateSyncConnectionState();
 
-                const conn = this.connections[fullResource];
+            conn.ws.onopen = () => {
                 conn.lastMessageTs = Date.now();
 
-                if (!conn.pingIntervall) {
-                    conn.pingIntervall = setIntervall() => {
+                if (!conn.pingInterval) {
+                    conn.pingInterval = setInterval(() => {
                         try {
                             if (conn.ws.readyState === WebSocket.OPEN) {
                                 conn.ws.ping();
                             }
-                        } catch (e)                    
-                    }, 20000);
+                        } catch (e) {
+                        }
+                    }, 30000);
+                }
+
+                this.updateSyncConnectionState();
+            };
+
+            conn.ws.onmessage = (message: any) => {
+                conn.lastMessageTs = Date.now();
+                try {
+                    this.updateState(JSON.parse(message.data), version);
+                } catch (e) {
+                    SyncLog.log("error", "NMOS", "Error parsing NMOS WS message", { error: (e as Error).message });
                 }
             };
 
-            this.connections[fullResource].ws.onmessage = (message) => {
-                const conn = this.connections[fullResource];
-                conn.lastMessageTs = Date.now();
-                this.updateState(JSON.parse(message.data),version);
-            };
-            
-            SyncLog.log("info",  "NMOS","Subscribed to Registry: " + nmosRegistryUrl + ", " + resource + ", " + version );
-        }).catch((error) => {
-            
-            //console.log(error);
-            	setTimeout(()=>{
-                    this.getVersionSubscription(nmosRegistryUrl,resource,version );
-                },20000)
-                if(this.logReset){
-                    this.logReset = false;
-                    SyncLog.log("error",  "NMOS","Error While creating NMOS Subscription on Registry: " + nmosRegistryUrl + ", " + resource + ", " + version, {message:error.message});
-                }
+            SyncLog.log(
+                "info",
+                "NMOS",
+                "Subscribed to Registry: " + nmosRegistryUrl + ", " + resource + ", " + version
+            );
+        })
+        .catch((error) => {
+            setTimeout(() => {
+                this.getVersionSubscription(nmosRegistryUrl, resource, version);
+            }, 20000);
+            if (this.logReset) {
+                this.logReset = false;
+                SyncLog.log(
+                    "error",
+                    "NMOS",
+                    "Error While creating NMOS Subscription on Registry: " +
+                        nmosRegistryUrl +
+                        ", " +
+                        resource +
+                        ", " +
+                        version,
+                    { message: error.message }
+                );
+            }
         });
-    }
+}
 
     private versionIsPrefered(oldVersion:string, newVersion:string, registry=true){
         let list = this.registryVersionList;
@@ -1151,6 +1244,9 @@ export class NmosRegistryConnector {
 interface Connection {
     subscription: any;
     ws: WebSocket;
+    version?: string;
+    lastMessageTs?: number;
+    pingInterval?: NodeJS.Timeout | null;
 }
 
 interface NmosRegistry {
