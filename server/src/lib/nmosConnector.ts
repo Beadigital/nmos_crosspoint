@@ -295,7 +295,7 @@ private startConnectionsWatchdog() {
                 }
             }
         });
-    }, 30000);
+    }, 20000);
 }
 
 
